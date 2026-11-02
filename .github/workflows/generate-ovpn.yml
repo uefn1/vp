@@ -1,7 +1,6 @@
 name: Scrape Paraguay OpenVPN profiles
 
 on:
-  # cron は削除。手動実行のみ
   workflow_dispatch:
     inputs:
       skip_check:
@@ -29,7 +28,7 @@ jobs:
         with:
           python-version: "3.12"
 
-      - name: Scrape & generate .ovpn
+      - name: Generate .ovpn files (OpenProxyList + VPN Gate)
         env:
           SKIP_CHECK: ${{ github.event.inputs.skip_check == 'true' && '1' || '0' }}
         run: |
@@ -40,32 +39,89 @@ jobs:
           import json
           import os
           import pathlib
+          import re
           import socket
           import sys
           import time
           import urllib.request
 
+          # ---- 設定 ----
+          OPENPROXYLIST_LIST_URL = "https://openproxylist.com/openvpn/"
+          OPENPROXYLIST_DOWNLOAD_BASE = "https://openproxylist.com/openvpn/download/"
           VPNGATE_API = "http://www.vpngate.net/api/iphone/"
           MIRROR_CSV = "https://cdn.jsdelivr.net/gh/GeorgeXie2333/vpngate-list-mirror@latest/data/vpngate.csv"
-          COUNTRY = "PY"          # Paraguay
+          COUNTRY = "PY"
           OUTDIR = pathlib.Path("output")
-          TIMEOUT = 10
+          TIMEOUT = 20
           SKIP_CHECK = os.environ.get("SKIP_CHECK", "0") == "1"
 
-          def fetch_csv():
+          HEADERS = {
+              "User-Agent": (
+                  "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+                  "AppleWebKit/537.36 (KHTML, like Gecko) "
+                  "Chrome/120.0 Safari/537.36"
+              ),
+              "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+          }
+
+          def fetch(url, as_bytes=False):
+              req = urllib.request.Request(url, headers=HEADERS)
+              with urllib.request.urlopen(req, timeout=TIMEOUT) as resp:
+                  data = resp.read()
+              return data if as_bytes else data.decode("utf-8", errors="replace")
+
+          # ============================================================
+          # Source 1: OpenProxyList (download/{id} から .ovpn を直接取得)
+          # ============================================================
+          def scrape_openproxylist_download_ids():
+              """OpenVPNリストページから download/{id} の ID を抽出する。"""
+              try:
+                  html = fetch(OPENPROXYLIST_LIST_URL)
+              except Exception as e:
+                  print(f"[warn] OpenProxyList list fetch failed: {e}", file=sys.stderr)
+                  return []
+
+              ids = set(re.findall(r'/openvpn/download/(\d+)', html))
+              if not ids:
+                  ids = set(re.findall(r'"id"\s*:\s*(\d+)', html))
+              if not ids:
+                  print(
+                      "[warn] OpenProxyList: download ID を抽出できませんでした。既知のIDを使用します。",
+                      file=sys.stderr,
+                  )
+                  ids = {"1442599"}
+
+              return sorted(ids, key=int)
+
+          def download_ovpn_from_openproxylist(server_id):
+              """download/{id} から .ovpn を取得する。"""
+              url = f"{OPENPROXYLIST_DOWNLOAD_BASE}{server_id}"
+              try:
+                  content = fetch(url)
+                  if "client" in content and "remote " in content:
+                      return content
+              except Exception as e:
+                  print(f"[warn] OpenProxyList download failed id={server_id}: {e}", file=sys.stderr)
+              return None
+
+          # ============================================================
+          # Source 2: VPN Gate (補助、0件でもエラーにしない)
+          # ============================================================
+          def fetch_vpngate_csv():
               for url in (VPNGATE_API, MIRROR_CSV):
                   try:
-                      req = urllib.request.Request(url, headers={"User-Agent": "Mozilla/5.0"})
-                      with urllib.request.urlopen(req, timeout=TIMEOUT) as resp:
-                          raw = resp.read().decode("utf-8", errors="replace")
-                      print(f"[info] fetched from {url} ({len(raw)} bytes)", flush=True)
+                      raw = fetch(url)
+                      print(f"[info] VPN Gate fetched from {url} ({len(raw)} bytes)", flush=True)
                       return raw
                   except Exception as e:
-                      print(f"[warn] fetch failed {url}: {e}", file=sys.stderr)
-              raise SystemExit("[error] CSV を取得できませんでした")
+                      print(f"[warn] VPN Gate fetch failed {url}: {e}", file=sys.stderr)
+              return None
 
-          def parse_csv(raw):
-              lines = [ln for ln in raw.replace("\r", "").split("\n") if ln and not ln.startswith("*")]
+          def parse_vpngate_csv(raw):
+              lines = [
+                  ln for ln in raw.replace("\r", "").split("\n")
+                  if ln and not ln.startswith("*")
+              ]
               if not lines:
                   return []
               header_line = lines[0]
@@ -74,7 +130,7 @@ jobs:
               reader = csv.DictReader(io.StringIO("\n".join([header_line] + lines[1:])))
               return list(reader)
 
-          def decode_ovpn(row):
+          def decode_vpngate_ovpn(row):
               b64 = row.get("OpenVPN_ConfigData_Base64", "")
               if not b64:
                   return None
@@ -83,6 +139,9 @@ jobs:
               except Exception:
                   return None
 
+          # ============================================================
+          # 疎通チェック
+          # ============================================================
           def check_tcp(host, port, timeout=5):
               try:
                   with socket.create_connection((host, port), timeout=timeout):
@@ -91,20 +150,28 @@ jobs:
                   return False
 
           def check_udp(host, port, timeout=5):
+              """OpenVPN P_CONTROL_HARD_RESET_CLIENT_V2 (0x38) で応答確認。"""
+              sock = None
               try:
                   sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
                   sock.settimeout(timeout)
-                  pkt = bytes([0x38]) + os.urandom(8) + (0).to_bytes(4, "big") + (0).to_bytes(4, "big")
+                  pkt = (
+                      bytes([0x38])
+                      + os.urandom(8)
+                      + (0).to_bytes(4, "big")
+                      + (0).to_bytes(4, "big")
+                  )
                   sock.sendto(pkt, (host, port))
                   data, _ = sock.recvfrom(2048)
                   return len(data) > 0
               except Exception:
                   return False
               finally:
-                  try:
-                      sock.close()
-                  except Exception:
-                      pass
+                  if sock is not None:
+                      try:
+                          sock.close()
+                      except Exception:
+                          pass
 
           def check_availability(host, port, proto):
               if SKIP_CHECK:
@@ -113,65 +180,110 @@ jobs:
               udp_ok = check_udp(host, port)
               return (tcp_ok or udp_ok), f"tcp={tcp_ok} udp={udp_ok}"
 
+          def parse_remote(ovpn):
+              host, port, proto = None, 1194, "udp"
+              for line in ovpn.splitlines():
+                  line = line.strip()
+                  if line.startswith("remote "):
+                      parts = line.split()
+                      if len(parts) >= 3:
+                          host = parts[1]
+                          try:
+                              port = int(parts[2])
+                          except ValueError:
+                              pass
+                          proto = parts[3] if len(parts) >= 4 else "udp"
+                      break
+                  if line.startswith("proto "):
+                      proto = line.split()[1]
+              return host, port, proto
+
+          # ============================================================
+          # メイン
+          # ============================================================
           def main():
               OUTDIR.mkdir(parents=True, exist_ok=True)
-              raw = fetch_csv()
-              rows = parse_csv(raw)
-
-              py_rows = [r for r in rows if (r.get("CountryShort") or "").strip() == COUNTRY]
-              if not py_rows:
-                  print(f"[error] パラグアイ({COUNTRY})のサーバーが見つかりません", file=sys.stderr)
-                  return 1
-
-              print(f"[info] Paraguay servers: {len(py_rows)}", flush=True)
-
               checks = {}
               generated = 0
 
-              for row in py_rows:
-                  host = (row.get("IP") or "").strip()
+              # --- Source 1: OpenProxyList ---
+              ids = scrape_openproxylist_download_ids()
+              print(f"[info] OpenProxyList download IDs: {len(ids)} 件", flush=True)
+
+              for sid in ids:
+                  ovpn = download_ovpn_from_openproxylist(sid)
+                  if not ovpn:
+                      continue
+                  host, port, proto = parse_remote(ovpn)
                   if not host:
                       continue
-                  sid = host.replace(".", "-")
-                  ovpn = decode_ovpn(row)
-                  if not ovpn:
-                      print(f"[warn] {sid}: OpenVPN設定が空のためスキップ", file=sys.stderr)
-                      continue
-
-                  port, proto = 1194, "udp"
-                  for line in ovpn.splitlines():
-                      line = line.strip()
-                      if line.startswith("remote "):
-                          parts = line.split()
-                          if len(parts) >= 3:
-                              host = parts[1]
-                              try:
-                                  port = int(parts[2])
-                              except ValueError:
-                                  pass
-                              proto = parts[3] if len(parts) >= 4 else "udp"
-                          break
-                      if line.startswith("proto "):
-                          proto = line.split()[1]
-
+                  key = f"opl-{sid}"
                   available, detail = check_availability(host, port, proto)
                   prefix = "T" if available else "F"
-                  checks[sid] = {
-                      "available": available, "host": host, "port": port,
-                      "proto": proto, "detail": detail, "prefix": prefix,
+                  checks[key] = {
+                      "available": available,
+                      "host": host,
+                      "port": port,
+                      "proto": proto,
+                      "detail": detail,
+                      "prefix": prefix,
+                      "source": "openproxylist",
                   }
-
-                  out = OUTDIR / f"{prefix}_Paraguay-{sid}.ovpn"
+                  out = OUTDIR / f"{prefix}_Paraguay-{key}.ovpn"
                   out.write_text(ovpn, encoding="utf-8")
                   generated += 1
-                  print(f"[{prefix}] {sid} {host}:{port}/{proto} :: {detail} -> {out}", flush=True)
+                  print(f"[{prefix}] {key} {host}:{port}/{proto} :: {detail} -> {out}", flush=True)
                   if not SKIP_CHECK:
                       time.sleep(0.5)
 
-              json.dump(checks, open("checks.json", "w", encoding="utf-8"), indent=2, ensure_ascii=False)
+              # --- Source 2: VPN Gate (補助) ---
+              raw = fetch_vpngate_csv()
+              if raw:
+                  rows = parse_vpngate_csv(raw)
+                  py_rows = [
+                      r for r in rows
+                      if (r.get("CountryShort") or "").strip().strip('"').upper() == COUNTRY
+                  ]
+                  print(f"[info] VPN Gate Paraguay servers: {len(py_rows)} 件", flush=True)
+
+                  for row in py_rows:
+                      host_ip = (row.get("IP") or "").strip()
+                      if not host_ip:
+                          continue
+                      ovpn = decode_vpngate_ovpn(row)
+                      if not ovpn:
+                          continue
+                      h, port, proto = parse_remote(ovpn)
+                      if not h:
+                          h = host_ip
+                      key = f"vg-{h.replace('.', '-')}"
+                      available, detail = check_availability(h, port, proto)
+                      prefix = "T" if available else "F"
+                      checks[key] = {
+                          "available": available,
+                          "host": h,
+                          "port": port,
+                          "proto": proto,
+                          "detail": detail,
+                          "prefix": prefix,
+                          "source": "vpngate",
+                      }
+                      out = OUTDIR / f"{prefix}_Paraguay-{key}.ovpn"
+                      out.write_text(ovpn, encoding="utf-8")
+                      generated += 1
+                      print(f"[{prefix}] {key} {h}:{port}/{proto} :: {detail} -> {out}", flush=True)
+                      if not SKIP_CHECK:
+                          time.sleep(0.5)
+
+              json.dump(
+                  checks,
+                  open("checks.json", "w", encoding="utf-8"),
+                  indent=2,
+                  ensure_ascii=False,
+              )
               ok = sum(1 for v in checks.values() if v["available"])
               print(f"[done] generated={generated} reachable={ok}/{len(checks)}")
-              return 0
+              return 0 if generated > 0 else 1
 
           if __name__ == "__main__":
               raise SystemExit(main())
@@ -182,7 +294,13 @@ jobs:
         run: |
           echo "=== Availability ==="
           if [ -f checks.json ]; then
-            python3 -c "import json;d=json.load(open('checks.json'));[print(('T' if v['available'] else 'F')+' '+k+' '+v['host']+' :: '+v['detail']) for k,v in d.items()]"
+            python3 - << 'PYEOF'
+          import json
+          d = json.load(open("checks.json"))
+          for k, v in d.items():
+              flag = "T" if v["available"] else "F"
+              print(f"{flag} {k} {v['host']}:{v['port']} [{v.get('source','?')}] :: {v['detail']}")
+          PYEOF
           fi
           echo "=== Output files ==="
           ls -la output/ || true
@@ -208,5 +326,5 @@ jobs:
           else
             gh release create "$TAG" output/*.ovpn checks.json \
               --title "Paraguay OpenVPN profiles $TAG" \
-              --notes "T_ = reachable, F_ = not reachable at build time. Import into OpenVPN Connect on iOS."
+              --notes "T_ = reachable, F_ = not reachable at build time. Sources: OpenProxyList, VPN Gate."
           fi

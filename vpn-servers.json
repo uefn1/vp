@@ -1,0 +1,78 @@
+{
+  "description": "Paraguay free VPN endpoints (publicly listed, availability not guaranteed)",
+  "updated": "2026-11-02",
+  "servers": [
+    {
+      "id": "py-01",
+      "name": "Paraguay VPN 01",
+      "host": "181.94.248.79",
+      "protocol": "IKEv2",
+      "localIdentifier": "ios-client",
+      "sharedSecret": "REPLACE_WITH_SECRET",
+      "organization": "Example Org"
+    },
+    {
+      "id": "py-02",
+      "name": "Paraguay VPN 02",
+      "host": "181.94.225.32",
+      "protocol": "IKEv2",
+      "localIdentifier": "ios-client",
+      "sharedSecret": "REPLACE_WITH_SECRET",
+      "organization": "Example Org"
+    },
+    {
+      "id": "py-03",
+      "name": "Paraguay VPN 03",
+      "host": "181.94.248.28",
+      "protocol": "IKEv2",
+      "localIdentifier": "ios-client",
+      "sharedSecret": "REPLACE_WITH_SECRET",
+      "organization": "Example Org"
+    },
+    {
+      "id": "py-04",
+      "name": "Paraguay VPN 04",
+      "host": "200.108.133.222",
+      "protocol": "IKEv2",
+      "localIdentifier": "ios-client",
+      "sharedSecret": "REPLACE_WITH_SECRET",
+      "organization": "Example Org"
+    },
+    {
+      "id": "py-05",
+      "name": "Paraguay VPN 05",
+      "host": "181.91.85.141",
+      "protocol": "IKEv2",
+      "localIdentifier": "ios-client",
+      "sharedSecret": "REPLACE_WITH_SECRET",
+      "organization": "Example Org"
+    },
+    {
+      "id": "py-06",
+      "name": "Paraguay VPN 06",
+      "host": "vpn845980874.opengw.net",
+      "protocol": "IKEv2",
+      "localIdentifier": "ios-client",
+      "sharedSecret": "REPLACE_WITH_SECRET",
+      "organization": "Example Org"
+    },
+    {
+      "id": "py-07",
+      "name": "Paraguay VPN 07",
+      "host": "181.94.224.201",
+      "protocol": "IKEv2",
+      "localIdentifier": "ios-client",
+      "sharedSecret": "REPLACE_WITH_SECRET",
+      "organization": "Example Org"
+    },
+    {
+      "id": "py-08",
+      "name": "Paraguay VPN 08",
+      "host": "181.91.86.141",
+      "protocol": "IKEv2",
+      "localIdentifier": "ios-client",
+      "sharedSecret": "REPLACE_WITH_SECRET",
+      "organization": "Example Org"
+    }
+  ]
+}

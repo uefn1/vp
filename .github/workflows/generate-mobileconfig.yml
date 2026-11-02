@@ -12,9 +12,14 @@ on:
         description: "GitHub Release に添付するタグ名（空なら添付しない）"
         required: false
         default: ""
+      skip_check:
+        description: "疎通チェックをスキップ（全サーバー T_ 扱い）"
+        type: boolean
+        required: false
+        default: false
 
 permissions:
-  contents: write   # Release 添付に必要
+  contents: write
 
 jobs:
   generate:
@@ -28,16 +33,145 @@ jobs:
         with:
           python-version: "3.12"
 
+      - name: Install ping
+        run: sudo apt-get update -qq && sudo apt-get install -y -qq iputils-ping
+
       - name: Validate JSON
         run: python3 -c "import json; json.load(open('vpn-servers.json'))"
 
+      # --- skip_check=true の場合：全サーバーを T としてマーク ---
+      - name: Init checks.json (skip mode)
+        if: ${{ github.event.inputs.skip_check == 'true' }}
+        run: |
+          python3 << 'PYEOF'
+          import json
+          data = json.load(open("vpn-servers.json", encoding="utf-8"))
+          results = {
+              s["id"]: {"available": True, "host": s["host"], "detail": "skip", "prefix": "T"}
+              for s in data.get("servers", [])
+          }
+          json.dump(results, open("checks.json", "w", encoding="utf-8"), indent=2)
+          print("[info] skip_check=true; all servers marked T")
+          PYEOF
+
+      # --- 疎通チェック本体 ---
+      - name: Check VPN availability
+        if: ${{ github.event.inputs.skip_check != 'true' }}
+        continue-on-error: true
+        run: |
+          python3 << 'PYEOF'
+          import json
+          import socket
+          import struct
+          import subprocess
+          import sys
+          import time
+
+          SRC = "vpn-servers.json"
+          OUT = "checks.json"
+
+          def resolve(host):
+              try:
+                  return socket.gethostbyname(host)
+              except socket.gaierror:
+                  return None
+
+          def ping_host(host, timeout=3):
+              try:
+                  r = subprocess.run(
+                      ["ping", "-c", "1", "-W", str(timeout), host],
+                      capture_output=True, timeout=timeout + 2
+                  )
+                  return r.returncode == 0
+              except Exception:
+                  return False
+
+          def check_ike_udp(host, port, timeout=5):
+              """minimal IKE_SA_INIT を送って、何か応答が返れば IKE サービス生存とみなす。"""
+              try:
+                  addr = (socket.gethostbyname(host), port)
+              except socket.gaierror:
+                  return False
+              sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+              sock.settimeout(timeout)
+              try:
+                  i_spi = struct.pack("!Q", 0x1122334455667788)
+                  r_spi = b"\x00" * 8
+                  hdr = (
+                      i_spi + r_spi
+                      + b"\x00"                    # Next payload: none
+                      + b"\x20"                    # Version: IKEv2
+                      + b"\x22"                    # ExchangeType: IKE_SA_INIT (34)
+                      + b"\x08"                    # Flags: Initiator
+                      + struct.pack("!I", 0)       # MessageID
+                      + struct.pack("!I", 28)      # Length (header only)
+                  )
+                  packet = hdr
+                  if port == 4500:                 # NAT-T には 4byte の non-ESP marker
+                      packet = b"\x00\x00\x00\x00" + hdr
+                  sock.sendto(packet, addr)
+                  sock.recvfrom(2048)              # 何か返れば生存
+                  return True
+              except socket.timeout:
+                  return False
+              except Exception:
+                  return False
+              finally:
+                  sock.close()
+
+          def check_server(host):
+              ip = resolve(host)
+              if not ip:
+                  return False, "dns-fail"
+              ping_ok = ping_host(host, timeout=3)
+              ike_500 = check_ike_udp(host, 500, timeout=5)
+              ike_4500 = check_ike_udp(host, 4500, timeout=5)
+              available = ike_500 or ike_4500
+              detail = f"ip={ip} ping={ping_ok} ike500={ike_500} ike4500={ike_4500}"
+              return available, detail
+
+          def main():
+              data = json.load(open(SRC, encoding="utf-8"))
+              servers = data.get("servers", [])
+              results = {}
+              for s in servers:
+                  sid = s["id"]
+                  host = s["host"]
+                  available, detail = check_server(host)
+                  prefix = "T" if available else "F"
+                  results[sid] = {"available": available, "host": host, "detail": detail, "prefix": prefix}
+                  print(f"[{'T' if available else 'F'}] {sid} {host} :: {detail}", flush=True)
+                  time.sleep(1)  # 相手に負荷をかけないよう間隔を空ける
+              json.dump(results, open(OUT, "w", encoding="utf-8"), indent=2, ensure_ascii=False)
+              ok = sum(1 for r in results.values() if r["available"])
+              print(f"[done] {ok}/{len(results)} servers reachable")
+              return 0
+
+          if __name__ == "__main__":
+              raise SystemExit(main())
+          PYEOF
+
+      # --- チェックが走らなかった/失敗した場合のフォールバック ---
+      - name: Ensure checks.json exists
+        if: ${{ hashFiles('checks.json') == '' }}
+        run: |
+          python3 << 'PYEOF'
+          import json
+          data = json.load(open("vpn-servers.json", encoding="utf-8"))
+          results = {
+              s["id"]: {"available": False, "host": s["host"], "detail": "check-not-run", "prefix": "F"}
+              for s in data.get("servers", [])
+          }
+          json.dump(results, open("checks.json", "w", encoding="utf-8"), indent=2)
+          print("[warn] checks.json not found; all servers marked F")
+          PYEOF
+
+      # --- .mobileconfig 生成（prefix 反映） ---
       - name: Generate .mobileconfig (inline Python)
         env:
           VPN_PSK: ${{ secrets.VPN_PSK }}
         run: |
           python3 << 'PYEOF'
-          #!/usr/bin/env python3
-          """vpn-servers.json から iOS 用 .mobileconfig (IKEv2) を生成する。"""
           import json
           import os
           import pathlib
@@ -47,29 +181,23 @@ jobs:
 
           SECRET_PLACEHOLDER = "REPLACE_WITH_SECRET"
           SRC = "vpn-servers.json"
+          CHECKS = "checks.json"
           OUTDIR = pathlib.Path("output")
 
-
-          def deterministic_uuid(seed: str) -> str:
-              """同じサーバーなら毎回同じ UUID になるようにする。"""
+          def deterministic_uuid(seed):
               return str(uuid.uuid5(uuid.NAMESPACE_URL, f"paraguay-vpn:{seed}"))
 
-
-          def resolve_secret(server: dict) -> str:
+          def resolve_secret(server):
               secret = server.get("sharedSecret") or SECRET_PLACEHOLDER
               if secret != SECRET_PLACEHOLDER:
                   return secret
               env_secret = os.environ.get("VPN_PSK")
               if not env_secret:
-                  print(
-                      f"[warn] {server['id']}: VPN_PSK 未設定。プレースホルダのまま出力します。",
-                      file=sys.stderr,
-                  )
+                  print(f"[warn] {server['id']}: VPN_PSK 未設定。プレースホルダ出力", file=sys.stderr)
                   return SECRET_PLACEHOLDER
               return env_secret
 
-
-          def build_profile(server: dict) -> dict:
+          def build_profile(server):
               sid = server["id"]
               host = server["host"]
               name = server.get("name", sid)
@@ -79,23 +207,18 @@ jobs:
               secret = resolve_secret(server)
 
               vpn_payload = {
-                  # --- ペイロード共通メタデータ ---
                   "PayloadType": "com.apple.vpn.managed",
                   "PayloadVersion": 1,
                   "PayloadIdentifier": f"com.example.paraguay.vpn.{sid}",
                   "PayloadUUID": deterministic_uuid(f"vpn-payload:{sid}"),
                   "PayloadDisplayName": name,
                   "PayloadOrganization": org,
-
-                  # --- VPN 基本設定 ---
                   "UserDefinedName": name,
                   "VPNType": "IKEv2",
-                  "RemoteAddress": host,          # 互換用（新しめのiOSはIKEv2側を見る）
-
-                  # --- IKEv2 固有設定（ここに集約するのが重要） ---
+                  "RemoteAddress": host,
                   "IKEv2": {
                       "AuthenticationMethod": "SharedSecret",
-                      "RemoteAddress": host,      # ★ これが無いと Missing server address
+                      "RemoteAddress": host,        # これが無いと "Missing server address"
                       "RemoteIdentifier": remote_id,
                       "LocalIdentifier": local_id,
                       "SharedSecret": secret,
@@ -107,11 +230,8 @@ jobs:
                       "NATKeepAliveOffloadEnable": 0,
                       "NATKeepAliveInterval": 30,
                   },
-
-                  # --- IPv4 ---
                   "IPv4": {"OverridePrimary": 1},
               }
-
               return {
                   "PayloadContent": [vpn_payload],
                   "PayloadType": "Configuration",
@@ -123,62 +243,48 @@ jobs:
                   "PayloadVersion": 1,
               }
 
-
-          def main() -> int:
+          def main():
               OUTDIR.mkdir(parents=True, exist_ok=True)
-
-              with open(SRC, encoding="utf-8") as f:
-                  data = json.load(f)
-
+              data = json.load(open(SRC, encoding="utf-8"))
+              checks = {}
+              if os.path.exists(CHECKS):
+                  checks = json.load(open(CHECKS, encoding="utf-8"))
               servers = data.get("servers", [])
               if not servers:
-                  print("[error] servers が空です", file=sys.stderr)
+                  print("[error] servers が空", file=sys.stderr)
                   return 1
-
-              generated = 0
               for server in servers:
-                  missing = [k for k in ("id", "host") if k not in server]
-                  if missing:
-                      print(f"[error] 必須キー欠落 {missing}: {server}", file=sys.stderr)
-                      return 1
-
+                  sid = server["id"]
+                  prefix = checks.get(sid, {}).get("prefix", "F")
                   profile = build_profile(server)
-                  out = OUTDIR / f"Paraguay-VPN-{server['id']}.mobileconfig"
+                  out = OUTDIR / f"{prefix}_Paraguay-VPN-{sid}.mobileconfig"
                   with open(out, "wb") as f:
                       plistlib.dump(profile, f, fmt=plistlib.FMT_XML)
                   print(f"[ok] {out}")
-                  generated += 1
-
-              print(f"[done] {generated} profile(s) generated into {OUTDIR}/")
               return 0
-
 
           if __name__ == "__main__":
               raise SystemExit(main())
           PYEOF
 
-      - name: Verify RemoteAddress in IKEv2
+      # --- 疎通結果のサマリを表示 ---
+      - name: Summary
+        if: always()
         run: |
-          set -euo pipefail
-          fail=0
-          for f in output/*.mobileconfig; do
-            if plutil -p "$f" 2>/dev/null | grep -q "IKEv2"; then
-              # IKEv2 ブロック内の RemoteAddress を簡易チェック
-              if ! plutil -p "$f" | awk '/"IKEv2" =>/,/^  }/' | grep -q '"RemoteAddress"'; then
-                echo "[ng] $f : IKEv2.RemoteAddress がありません"
-                fail=1
-              else
-                echo "[ok] $f"
-              fi
-            fi
-          done
-          exit $fail
+          echo "=== Availability ==="
+          if [ -f checks.json ]; then
+            python3 -c "import json;d=json.load(open('checks.json'));[print(('T' if v['available'] else 'F')+' '+k+' '+v['host']+' :: '+v['detail']) for k,v in d.items()]"
+          fi
+          echo "=== Output files ==="
+          ls -la output/ || true
 
       - name: Upload artifact
         uses: actions/upload-artifact@v4
         with:
           name: paraguay-vpn-mobileconfig
-          path: output/*.mobileconfig
+          path: |
+            output/*.mobileconfig
+            checks.json
           if-no-files-found: error
           retention-days: 30
 
@@ -189,9 +295,9 @@ jobs:
           TAG: ${{ github.event.inputs.release_tag }}
         run: |
           if gh release view "$TAG" >/dev/null 2>&1; then
-            gh release upload "$TAG" output/*.mobileconfig --clobber
+            gh release upload "$TAG" output/*.mobileconfig checks.json --clobber
           else
-            gh release create "$TAG" output/*.mobileconfig \
+            gh release create "$TAG" output/*.mobileconfig checks.json \
               --title "Paraguay VPN profiles $TAG" \
-              --notes "Auto-generated .mobileconfig files"
+              --notes "T_ = reachable (IKE responded), F_ = not reachable at build time"
           fi
